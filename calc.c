@@ -19,7 +19,7 @@
 
 // ---------- Configuration for naming ----------
 static const char *STUDENT_FIRST = "Eren";
-static const char *STUDENT_LAST  = "Unal";     // ASCII-safe last name
+static const char *STUDENT_LAST  = "Unal";    
 static const char *STUDENT_ID    = "241adb152";
 
 // ---------- Tokenizer ----------
