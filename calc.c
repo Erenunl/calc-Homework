@@ -1,6 +1,5 @@
 // Eren Unal 241adb152
-// Compile with: gcc -O2 -Wall -Wextra -std=c17 -o calc calc.c
-// Compile with: gcc -O2 -Wall -Wextra -std=c17 -lm -o calc calc.c
+// Compile with: gcc -O2 -Wall -Wextra -std=c17 -o calc calc.c -lm
 #define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
