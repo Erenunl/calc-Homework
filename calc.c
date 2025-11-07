@@ -33,8 +33,8 @@ typedef enum {
 
 typedef struct {
     TokenKind kind;
-    double    num;        // parsed numeric value for T_NUM
-    size_t    start_pos;  // 1-based absolute char index in entire file
+    double    num;        
+    size_t    start_pos;  
 } Token;
 
 typedef struct {
@@ -44,11 +44,11 @@ typedef struct {
 } TokenVec;
 
 typedef struct {
-    const char *src;      // whole file buffer (NUL-terminated copy)
-    size_t      n;        // length excluding NUL
-    size_t      i;        // current index into src
-    size_t      abspos;   // 1-based absolute char position (src[0] at pos=1)
-    int         at_line_start; // 1 if we are at beginning of a line (after '\n' or start)
+    const char *src;      
+    size_t      n;        
+    size_t      i;       
+    size_t      abspos;   
+    int         at_line_start; 
 } Scanner;
 
 static void tv_init(TokenVec *v) { v->data=NULL; v->len=0; v->cap=0; }
@@ -180,8 +180,8 @@ static void scan_tokens(Scanner *s, TokenVec *out) {
 // ---------- Parser / Evaluator ----------
 typedef struct {
     TokenVec toks;
-    size_t   idx;        // current index in toks
-    size_t   error_pos;  // first error position (1-based), 0 if none
+    size_t   idx;        
+    size_t   error_pos;  
 } Parser;
 
 static Token *peek(Parser *p) {
@@ -199,7 +199,7 @@ static int match(Parser *p, TokenKind k) {
 
 typedef struct {
     double value;
-    size_t start_pos; // start position of this subexpression's first token (used for error contexts like division by zero)
+    size_t start_pos; 
 } Eval;
 
 // Forward declarations
@@ -250,7 +250,7 @@ static Eval parse_power(Parser *p) {
         // pow with doubles; mimic Python: 0**0 == 1
         errno = 0;
         double res = pow(left.value, right.value);
-        (void)powTok; // currently not used for error pos; errors are numeric-domain; not specified -> allow NaN/inf unless div-by-zero
+        (void)powTok; 
         return make_eval(res, left.start_pos);
     }
     return left;
@@ -268,7 +268,7 @@ static Eval parse_term(Parser *p) {
             if (k == T_STAR) {
                 acc.value = acc.value * rhs.value;
             } else {
-                // Division: detect zero divisor numerically
+                
                 if (fabs(rhs.value) <= 0.0) {
                     // report at start of divisor (rhs)
                     set_error(p, rhs.start_pos);
@@ -276,7 +276,7 @@ static Eval parse_term(Parser *p) {
                 }
                 acc.value = acc.value / rhs.value;
             }
-            // keep acc.start_pos as the leftmost token of this subexpression
+            
         } else {
             break;
         }
