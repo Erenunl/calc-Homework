@@ -1,7 +1,7 @@
 // Eren Unal 241adb152
-// Compile with: gcc -O2 -Wall -Wextra -std=c17 -o calc calc.c -lm
-#define _POSIX_C_SOURCE 200809L
-
+// gcc -std=c11 -O2 -Wall -Wextra -o calc calc.c -lm
+// ./calc test8.txt
+//
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,504 +12,330 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
-#ifndef PATH_MAX
-#define PATH_MAX 4096
+#ifdef _WIN32
+#define SEP "\\"
+#else
+#define SEP "/"
 #endif
 
-// ---------- Configuration for naming ----------
-static const char *STUDENT_FIRST = "Eren";
-static const char *STUDENT_LAST  = "Unal";    
-static const char *STUDENT_ID    = "241adb152";
-
-// ---------- Tokenizer ----------
-typedef enum {
-    T_EOF = 0,
-    T_NUM,
-    T_PLUS, T_MINUS,
-    T_STAR, T_SLASH,
-    T_POW,          // **
-    T_LPAREN, T_RPAREN
-} TokenKind;
+// === TOKEN DEFINITIONS ===
+typedef enum { 
+    T_NUMBER, T_PLUS, T_MINUS, T_STAR, T_SLASH, 
+    T_POW, T_LPAREN, T_RPAREN, T_EOF 
+} TokenType;
 
 typedef struct {
-    TokenKind kind;
-    double    num;        
-    size_t    start_pos;  
+    TokenType type;
+    const char *start;
+    int pos1;
+    double num;
 } Token;
 
+// === SCANNER ===
+// Converts input string into a stream of tokens.
 typedef struct {
-    Token *data;
+    const char *src;
     size_t len;
-    size_t cap;
-} TokenVec;
-
-typedef struct {
-    const char *src;      
-    size_t      n;        
-    size_t      i;       
-    size_t      abspos;   
-    int         at_line_start; 
+    size_t i;
+    int pos1;
+    int at_line_start;
 } Scanner;
 
-static void tv_init(TokenVec *v) { v->data=NULL; v->len=0; v->cap=0; }
-static void tv_push(TokenVec *v, Token t) {
-    if (v->len == v->cap) {
-        size_t nc = v->cap ? v->cap*2 : 64;
-        Token *nd = (Token*)realloc(v->data, nc * sizeof(Token));
-        if (!nd) { perror("realloc"); exit(1); }
-        v->data = nd; v->cap = nc;
-    }
-    v->data[v->len++] = t;
+static int g_err = 0;
+static void set_err(int p){ if(!g_err) g_err = p; }
+
+static void scan_init(Scanner *S, const char *src, size_t len){
+    S->src = src; S->len = len; S->i = 0; S->pos1 = 1; S->at_line_start = 1;
 }
-static void tv_free(TokenVec *v) { free(v->data); v->data=NULL; v->len=v->cap=0; }
-
-static void scan_init(Scanner *s, const char *src, size_t n) {
-    s->src = src; s->n = n; s->i = 0; s->abspos = 1; s->at_line_start = 1;
-}
-
-static int is_line_ws(int c) { return c==' ' || c=='\t' || c=='\r'; }
-
-static void skip_ws_and_comments(Scanner *s) {
-    for (;;) {
-        // At line start, skip spaces/tabs, then if '#' -> skip to end of line
-        size_t saved_i = s->i;
-        size_t saved_pos = s->abspos;
-        if (s->at_line_start) {
-            while (s->i < s->n && is_line_ws((unsigned char)s->src[s->i])) {
-                if (s->src[s->i] == '\t' || s->src[s->i] == ' ' || s->src[s->i] == '\r') {
-                    s->i++; s->abspos++;
-                } else {
-                    break;
-                }
-            }
-            if (s->i < s->n && s->src[s->i] == '#') {
-                // skip until '\n' or EOF
-                while (s->i < s->n) {
-                    char c = s->src[s->i++];
-                    s->abspos++;
-                    if (c == '\n') { s->at_line_start = 1; break; }
-                }
-                continue; // loop again in case next line is also comment/blank
-            }
-        }
-        // General whitespace anywhere (including newlines). Newline ends "line start" and begins next.
-        int progressed = 0;
-        while (s->i < s->n) {
-            char c = s->src[s->i];
-            if (c==' ' || c=='\t' || c=='\r') {
-                s->i++; s->abspos++; progressed=1;
-            } else if (c=='\n') {
-                s->i++; s->abspos++; progressed=1;
-                s->at_line_start = 1;
-            } else {
-                break;
-            }
-        }
-        // If we didn't consume anything in this iteration and no comment matched, we are done
-        if (!progressed && (saved_i == s->i && saved_pos == s->abspos)) break;
-        // Otherwise, loop again to catch a possible comment after new line start
-    }
+static int peek(Scanner *S){ return (S->i>=S->len)? EOF : (unsigned char)S->src[S->i]; }
+static int getc2(Scanner *S){
+    if (S->i>=S->len) return EOF;
+    int c = (unsigned char)S->src[S->i++];
+    S->pos1++;
+    S->at_line_start = (c=='\n');
+    return c;
 }
 
-static Token make_token(TokenKind k, size_t pos) {
-    Token t; t.kind = k; t.num = 0.0; t.start_pos = pos; return t;
-}
-
-static void scan_tokens(Scanner *s, TokenVec *out) {
-    tv_init(out);
-    while (s->i < s->n) {
-        skip_ws_and_comments(s);
-        if (s->i >= s->n) break;
-
-        size_t tok_pos = s->abspos;
-        char c = s->src[s->i];
-
-        // Numbers (float allowed). We do NOT treat leading +/- as unary here.
-        if (isdigit((unsigned char)c) || (c=='.' && s->i+1<s->n && isdigit((unsigned char)s->src[s->i+1]))) {
-            // strtod from current location
-            char *endptr = NULL;
-            errno = 0;
-            double val = strtod(s->src + s->i, &endptr);
-            // compute how many chars consumed
-            size_t consumed = (size_t)(endptr - (s->src + s->i));
-            if (consumed == 0) {
-                // Should not happen due to initial check, treat as single '.' token error later
-                s->i++; s->abspos++;
-                tv_push(out, make_token(T_EOF, tok_pos)); // force stop
-                break;
-            } else {
-                // Advance
-                s->i += consumed;
-                s->abspos += consumed;
-                Token t = make_token(T_NUM, tok_pos);
-                t.num = val;
-                tv_push(out, t);
-                s->at_line_start = 0;
+// Skip spaces and line comments starting with '#'
+static void skip_ws_and_comment(Scanner *S){
+    for(;;){
+        while(isspace(peek(S))) getc2(S);
+        if (S->at_line_start){
+            size_t j=S->i;
+            while(j<S->len && isspace((unsigned char)S->src[j]) && S->src[j]!='\n') j++;
+            if (j<S->len && S->src[j]=='#'){
+                while(1){ int c=getc2(S); if(c=='\n'||c==EOF) break; }
                 continue;
             }
         }
-
-        // Operators / Parens
-        if (c == '+') { s->i++; s->abspos++; tv_push(out, make_token(T_PLUS, tok_pos)); s->at_line_start=0; continue; }
-        if (c == '-') { s->i++; s->abspos++; tv_push(out, make_token(T_MINUS,tok_pos)); s->at_line_start=0; continue; }
-        if (c == '*') {
-            // check for '**'
-            if (s->i+1 < s->n && s->src[s->i+1] == '*') {
-                s->i += 2; s->abspos += 2; tv_push(out, make_token(T_POW, tok_pos)); s->at_line_start=0; continue;
-            } else {
-                s->i++; s->abspos++; tv_push(out, make_token(T_STAR, tok_pos)); s->at_line_start=0; continue;
-            }
-        }
-        if (c == '/') { s->i++; s->abspos++; tv_push(out, make_token(T_SLASH, tok_pos)); s->at_line_start=0; continue; }
-        if (c == '(') { s->i++; s->abspos++; tv_push(out, make_token(T_LPAREN, tok_pos)); s->at_line_start=0; continue; }
-        if (c == ')') { s->i++; s->abspos++; tv_push(out, make_token(T_RPAREN, tok_pos)); s->at_line_start=0; continue; }
-
-        // Unknown character: push a fake token to allow parser to flag error at this pos, then try to resync
-        // But per spec, we report first error position; pushing EOF-like stop helps.
-        // We'll represent this by pushing a T_EOF but at current position, which parser will likely treat as unexpected.
-        // Before that, advance one char to avoid infinite loop.
-        s->i++; s->abspos++; s->at_line_start = (s->src[s->i-1] == '\n');
-        // Create a special token sequence: we'll encode as PLUS of a 0-length? Simpler: store as EOF and stop.
-        tv_push(out, make_token(T_EOF, tok_pos));
         break;
     }
-    // EOF token with start at position n+1
-    tv_push(out, make_token(T_EOF, s->n + 1));
 }
 
-// ---------- Parser / Evaluator ----------
-typedef struct {
-    TokenVec toks;
-    size_t   idx;        
-    size_t   error_pos;  
-} Parser;
+// === TOKENIZER ===
+static Token next_tok(Scanner *S){
+    skip_ws_and_comment(S);
+    Token t; memset(&t,0,sizeof(t));
+    t.start = S->src + S->i;
+    t.pos1 = S->pos1;
 
-static Token *peek(Parser *p) {
-    if (p->idx < p->toks.len) return &p->toks.data[p->idx];
-    return &p->toks.data[p->toks.len-1];
-}
-static Token *advance(Parser *p) {
-    if (p->idx < p->toks.len) return &p->toks.data[p->idx++];
-    return &p->toks.data[p->toks.len-1];
-}
-static int match(Parser *p, TokenKind k) {
-    if (peek(p)->kind == k) { advance(p); return 1; }
-    return 0;
-}
+    int c = peek(S);
+    if (c==EOF){ t.type = T_EOF; return t; }
 
-typedef struct {
-    double value;
-    size_t start_pos; 
-} Eval;
-
-// Forward declarations
-static Eval parse_expr(Parser *p);
-static Eval parse_term(Parser *p);
-static Eval parse_power(Parser *p);
-static Eval parse_primary(Parser *p);
-
-static void set_error(Parser *p, size_t pos) {
-    if (p->error_pos == 0) p->error_pos = pos ? pos : 1;
-}
-
-static Eval make_eval(double v, size_t pos) { Eval e; e.value=v; e.start_pos=pos; return e; }
-
-static Eval parse_primary(Parser *p) {
-    Token *t = peek(p);
-    if (t->kind == T_NUM) {
-        advance(p);
-        return make_eval(t->num, t->start_pos);
-    }
-    if (t->kind == T_LPAREN) {
-        size_t lpos = t->start_pos;
-        advance(p);
-        Eval e = parse_expr(p);
-        if (p->error_pos) return e;
-        if (!match(p, T_RPAREN)) {
-            // Expected ')': report at current token start (which could be EOF at n+1)
-            set_error(p, peek(p)->start_pos);
-            return e;
-        }
-        // For position, keep '(' position as the start of this primary
-        return make_eval(e.value, lpos);
-    }
-    // Unexpected token
-    set_error(p, t->start_pos);
-    return make_eval(0.0, t->start_pos);
-}
-
-// Right-associative power: primary ('**' power)?
-static Eval parse_power(Parser *p) {
-    Eval left = parse_primary(p);
-    if (p->error_pos) return left;
-    if (match(p, T_POW)) {
-        // Exponent part
-        Token *powTok = &p->toks.data[p->idx-1];
-        Eval right = parse_power(p); // recurse for right-assoc
-        if (p->error_pos) return left;
-        // pow with doubles; mimic Python: 0**0 == 1
+    // number literal
+    if (isdigit(c) || c=='.'){
+        char *endp;
         errno = 0;
-        double res = pow(left.value, right.value);
-        (void)powTok; 
-        return make_eval(res, left.start_pos);
+        double v = strtod(S->src + S->i, &endp);
+        if (endp == S->src + S->i){
+            getc2(S);
+            set_err(t.pos1);
+            t.type = T_EOF;
+            return t;
+        }
+        size_t used = (size_t)(endp - (S->src + S->i));
+        for(size_t k=0;k<used;k++) getc2(S);
+        t.type = T_NUMBER; t.num = v;
+        return t;
+    }
+
+    // symbols and operators
+    if (c=='+'){ getc2(S); t.type=T_PLUS; return t; }
+    if (c=='-'){ getc2(S); t.type=T_MINUS; return t; }
+    if (c=='*'){
+        getc2(S);
+        if (peek(S)=='*'){ getc2(S); t.type=T_POW; return t; }
+        t.type=T_STAR; return t;
+    }
+    if (c=='/'){ getc2(S); t.type=T_SLASH; return t; }
+    if (c=='('){ getc2(S); t.type=T_LPAREN; return t; }
+    if (c==')'){ getc2(S); t.type=T_RPAREN; return t; }
+
+    // unknown character
+    getc2(S); set_err(t.pos1); t.type=T_EOF; return t;
+}
+
+// === PARSER ===
+typedef struct { Token *a; size_t n, cap; } TV;
+static void tv_push(TV *v, Token t){
+    if (v->n==v->cap){ v->cap = v->cap? v->cap*2 : 64; v->a = (Token*)realloc(v->a, v->cap*sizeof(Token)); }
+    v->a[v->n++] = t;
+}
+
+typedef struct { TV toks; size_t i; } Parser;
+static Token* p_peek(Parser *P){ return (P->i<P->toks.n)? &P->toks.a[P->i] : NULL; }
+static Token* p_adv(Parser *P){ if(P->i<P->toks.n) P->i++; return &P->toks.a[P->i-1]; }
+static int p_match(Parser *P, TokenType tp){ Token *t=p_peek(P); if(t && t->type==tp){ p_adv(P); return 1;} return 0; }
+
+static double parse_expr(Parser *P);
+
+// primary: numbers or parenthesis
+static double parse_primary(Parser *P, int *outpos){
+    Token *t = p_peek(P);
+    if (!t){ set_err(1); return 0; }
+    if (t->type==T_NUMBER){ *outpos = t->pos1; p_adv(P); return t->num; }
+    if (p_match(P,T_LPAREN)){
+        int lpos = P->toks.a[P->i-1].pos1;
+        double v = parse_expr(P);
+        if (!p_match(P,T_RPAREN)){
+            Token *u = p_peek(P);
+            if (u) set_err(u->pos1); else set_err(lpos);
+        }
+        *outpos = lpos; return v;
+    }
+    set_err(t->pos1); return 0;
+}
+
+// handle unary +/- (like -3 or +4)
+static double parse_unary(Parser *P, int *outpos){
+    int sign = 1, pos = 0;
+    while (p_match(P,T_PLUS) || p_match(P,T_MINUS)){
+        Token *prev = &P->toks.a[P->i-1];
+        if (prev->type==T_MINUS) sign = -sign;
+        pos = prev->pos1;
+    }
+    double v = parse_primary(P, &pos);
+    *outpos = pos; return sign*v;
+}
+
+// exponentiation right-associative (**)
+static double parse_power(Parser *P, int *outpos){
+    double left = parse_unary(P, outpos);
+    if (p_match(P,T_POW)){
+        int rpos=0; double right = parse_power(P, &rpos);
+        *outpos = P->toks.a[P->i-1].pos1; return pow(left, right);
     }
     return left;
 }
 
-static Eval parse_term(Parser *p) {
-    Eval acc = parse_power(p);
-    if (p->error_pos) return acc;
-    for (;;) {
-        TokenKind k = peek(p)->kind;
-        if (k == T_STAR || k == T_SLASH) {
-            Token *op = advance(p);
-            Eval rhs = parse_power(p);
-            if (p->error_pos) return acc;
-            if (k == T_STAR) {
-                acc.value = acc.value * rhs.value;
-            } else {
-                
-                if (fabs(rhs.value) <= 0.0) {
-                    // report at start of divisor (rhs)
-                    set_error(p, rhs.start_pos);
-                    return acc;
-                }
-                acc.value = acc.value / rhs.value;
-            }
-            
-        } else {
-            break;
-        }
+// * and /
+static double parse_term(Parser *P, int *outpos){
+    int apos=0; double val = parse_power(P,&apos);
+    for(;;){
+        if (p_match(P,T_STAR)){
+            int bpos=0; double b = parse_power(P,&bpos);
+            val *= b; *outpos = bpos;
+        } else if (p_match(P,T_SLASH)){
+            int bpos=0; double b = parse_power(P,&bpos);
+            if (fabs(b) < 1e-12){ set_err(bpos); return 0; }
+            val /= b; *outpos = bpos;
+        } else break;
     }
-    return acc;
+    return val;
 }
 
-static Eval parse_expr(Parser *p) {
-    Eval acc = parse_term(p);
-    if (p->error_pos) return acc;
-    for (;;) {
-        TokenKind k = peek(p)->kind;
-        if (k == T_PLUS || k == T_MINUS) {
-            advance(p);
-            Eval rhs = parse_term(p);
-            if (p->error_pos) return acc;
-            if (k == T_PLUS) acc.value = acc.value + rhs.value;
-            else             acc.value = acc.value - rhs.value;
-        } else {
-            break;
-        }
+// + and -
+static double parse_expr(Parser *P){
+    int pos=0; double v = parse_term(P,&pos);
+    for(;;){
+        if (p_match(P,T_PLUS)){ int p2=0; v += parse_term(P,&p2); }
+        else if (p_match(P,T_MINUS)){ int p2=0; v -= parse_term(P,&p2); }
+        else break;
     }
-    return acc;
+    return v;
 }
 
-// ---------- Evaluation entry ----------
-static int is_integral_double(double x) {
-    // Check closeness to nearest long long
-    double r = nearbyint(x);
-    return fabs(x - r) < 1e-12;
+// tokenize whole input
+static void tokenize_all(Scanner *S, TV *out){
+    memset(out,0,sizeof(*out));
+    for(;;){
+        Token t = next_tok(S);
+        tv_push(out,t);
+        if (t.type==T_EOF) break;
+        if (g_err) break;
+    }
 }
 
-static int evaluate_buffer(const char *buf, size_t n, double *out_val, size_t *out_errpos) {
-    Scanner s; scan_init(&s, buf, n);
-    TokenVec v; scan_tokens(&s, &v);
-    Parser p; p.toks = v; p.idx = 0; p.error_pos = 0;
+// === EVALUATION AND OUTPUT ===
+static int eval_and_write(const char *buf, size_t len, FILE *fo){
+    g_err = 0;
+    Scanner Sc; scan_init(&Sc, buf, len);
+    TV v; tokenize_all(&Sc, &v);
 
-    Eval e = parse_expr(&p);
-    if (p.error_pos == 0) {
-        // after parse, expect EOF
-        if (peek(&p)->kind != T_EOF) {
-            set_error(&p, peek(&p)->start_pos);
-        }
+    if (!g_err){
+        Parser P; P.toks = v; P.i=0;
+        (void)parse_expr(&P);
+        Token *t = p_peek(&P);
+        if (t && t->type!=T_EOF) set_err(t->pos1);
     }
-    int ok = 0;
-    if (p.error_pos) {
-        *out_errpos = p.error_pos;
-        ok = 0;
+
+    if (g_err){
+        fprintf(fo, "ERROR:%d\n", g_err);
+        free(v.a);
+        return 1;
     } else {
-        *out_val = e.value;
-        ok = 1;
+        Parser P2; P2.toks = v; P2.i=0;
+        double val = parse_expr(&P2);
+        double near = llround(val);
+        if (fabs(val - near) < 1e-12) fprintf(fo, "%lld\n", (long long)near);
+        else fprintf(fo, "%.15g\n", val);
+        free(v.a);
+        return 0;
     }
-    tv_free(&v);
-    return ok;
 }
 
-// ---------- Filesystem utilities ----------
-static int ensure_dir_exists(const char *path) {
+// === FILE & DIRECTORY HELPERS ===
+static const char* getenv_or(const char *k, const char *d){
+    const char *v = getenv(k); return (v && *v)? v : d;
+}
+
+static int ensure_dir(const char *path){
     struct stat st;
-    if (stat(path, &st) == 0) {
+    if (stat(path,&st)==0){
+#ifdef S_ISDIR
         if (S_ISDIR(st.st_mode)) return 0;
-        fprintf(stderr, "Path exists but is not a directory: %s\n", path);
-        return -1;
-    }
-    if (mkdir(path, 0775) != 0) {
-        perror("mkdir");
-        return -1;
-    }
-    return 0;
-}
-
-static const char *basename_noext(const char *path, char *out, size_t outsz) {
-    const char *base = strrchr(path, '/');
-#ifdef _WIN32
-    const char *base2 = strrchr(path, '\\');
-    if (!base || (base2 && base2 > base)) base = base2;
+#else
+        if ((st.st_mode & S_IFMT) == S_IFDIR) return 0;
 #endif
-    base = base ? base+1 : path;
-    // copy base
-    snprintf(out, outsz, "%s", base);
-    // strip extension if ".txt"
-    size_t len = strlen(out);
-    if (len >= 4 && strcmp(out+len-4, ".txt") == 0) {
-        out[len-4] = '\0';
+        errno = ENOTDIR; return -1;
     }
-    return out;
-}
-
-static void choose_default_outdir(const char *input_label, char *outdir, size_t outdir_sz) {
-    // <input_base>_<username>_<studentid>
-    const char *user = getenv("USER");
 #ifdef _WIN32
-    if (!user) user = getenv("USERNAME");
+    return mkdir(path);
+#else
+    return mkdir(path, 0775);
 #endif
-    if (!user) user = "user";
-    snprintf(outdir, outdir_sz, "%s_%s_%s", input_label, user, STUDENT_ID);
 }
 
-// ---------- I/O processing ----------
-static int write_result_file(const char *outdir, const char *infile_path, int is_dir_mode, double val, int ok, size_t errpos) {
-    char base[PATH_MAX]; basename_noext(infile_path, base, sizeof(base));
+// build default output dir name: <basename>_eren_<id>
+static void build_default_outdir(const char *input_path, char *out, size_t n){
+    const char *slash = strrchr(input_path, SEP[0]);
+    const char *base = slash? slash+1 : input_path;
+    char base_noext[256]; memset(base_noext,0,sizeof(base_noext));
+    strncpy(base_noext, base, sizeof(base_noext)-1);
+    char *dot = strrchr(base_noext, '.'); if (dot) *dot = '\0';
+    const char *user = getenv_or("USER","eren");
+    const char *sid  = getenv_or("STUDENT_ID","241adb152");
+    snprintf(out, n, "%s_%s_%s", base_noext, user, sid);
+}
 
-    // Output filename: <base>_Eren_Unal_241adb152.txt
-    char outname[PATH_MAX];
-    snprintf(outname, sizeof(outname), "%s_%s_%s_%s.txt", base, STUDENT_FIRST, STUDENT_LAST, STUDENT_ID);
+// build file name for output
+static void build_output_filename(const char *input_path, char *out, size_t n){
+    const char *slash = strrchr(input_path, SEP[0]);
+    const char *base = slash? slash+1 : input_path;
+    const char *nm  = getenv_or("NAME","Eren");
+    const char *ln  = getenv_or("LASTNAME","Unal");
+    const char *sid = getenv_or("STUDENT_ID","241adb152");
+    snprintf(out, n, "%s_%s_%s_%s.txt", base, nm, ln, sid);
+}
 
-    char outpath[PATH_MAX];
-    snprintf(outpath, sizeof(outpath), "%s/%s", outdir, outname);
+// read full file into memory
+static char* read_all(const char *path, size_t *olen){
+    FILE *f = fopen(path,"rb"); if(!f) return NULL;
+    fseek(f,0,SEEK_END); long sz = ftell(f); if(sz<0){ fclose(f); return NULL; }
+    fseek(f,0,SEEK_SET);
+    char *buf = (char*)malloc((size_t)sz+1); if(!buf){ fclose(f); return NULL; }
+    size_t n = fread(buf,1,(size_t)sz,f); fclose(f); buf[n]='\0'; if(olen) *olen=n; return buf;
+}
 
-    FILE *f = fopen(outpath, "w");
-    if (!f) { perror("fopen output"); return -1; }
-    if (!ok) {
-        fprintf(f, "ERROR:%zu\n", errpos);
-    } else {
-        if (is_integral_double(val)) {
-            // print as integer without decimal
-            // Use llround to avoid "-0"
-            long long ival = (long long) llround(val);
-            fprintf(f, "%lld\n", ival);
-        } else {
-            fprintf(f, "%.15g\n", val);
+static int ends_with(const char *s, const char *suf){
+    size_t a=strlen(s), b=strlen(suf); if(b>a) return 0; return strncmp(s+(a-b),suf,b)==0;
+}
+
+// process one .txt file
+static int process_one(const char *in_path, const char *out_dir){
+    size_t len=0; char *buf = read_all(in_path,&len);
+    if(!buf){ fprintf(stderr,"read fail: %s\n", in_path); return 1; }
+    if (ensure_dir(out_dir)!=0){ fprintf(stderr,"outdir fail: %s\n", out_dir); free(buf); return 1; }
+    char out_name[512]; build_output_filename(in_path,out_name,sizeof(out_name));
+    char out_path[1024]; snprintf(out_path,sizeof(out_path), "%s%s%s", out_dir, SEP, out_name);
+    FILE *fo = fopen(out_path,"wb"); if(!fo){ fprintf(stderr,"write fail: %s\n", out_path); free(buf); return 1; }
+    (void)eval_and_write(buf,len,fo);
+    fclose(fo); free(buf); return 0;
+}
+
+// === MAIN ===
+static void usage(void){
+    fprintf(stderr,"Usage:\n");
+    fprintf(stderr,"  calc [-d DIR|--dir DIR] [-o OUTDIR|--output-dir OUTDIR] input.txt\n");
+}
+
+int main(int argc, char **argv){
+    const char *dir = NULL, *outd=NULL, *input=NULL;
+    for(int i=1;i<argc;i++){
+        if(!strcmp(argv[i],"-d")||!strcmp(argv[i],"--dir")){ if(i+1>=argc){usage(); return 1;} dir=argv[++i]; }
+        else if(!strcmp(argv[i],"-o")||!strcmp(argv[i],"--output-dir")){ if(i+1>=argc){usage(); return 1;} outd=argv[++i]; }
+        else if(argv[i][0]=='-'){ usage(); return 1; }
+        else input=argv[i];
+    }
+    if(!input){ usage(); return 1; }
+
+    char def_out[512]={0};
+    if(!outd){ build_default_outdir(input,def_out,sizeof(def_out)); outd=def_out; }
+
+    int rc=0;
+    if (dir){
+        DIR *d = opendir(dir);
+        if(!d){ fprintf(stderr,"dir open fail: %s\n", dir); return 1; }
+        struct dirent *e;
+        while((e=readdir(d))){
+            if(e->d_name[0]=='.') continue;
+            if(!ends_with(e->d_name,".txt")) continue;
+            char in_path[1024]; snprintf(in_path,sizeof(in_path), "%s%s%s", dir, SEP, e->d_name);
+            rc |= process_one(in_path, outd);
         }
-    }
-    fclose(f);
-    return 0;
-}
-
-static int process_single_file(const char *infile, const char *outdir) {
-    // Read entire file
-    FILE *f = fopen(infile, "rb");
-    if (!f) { perror("fopen input"); return -1; }
-    if (fseek(f, 0, SEEK_END) != 0) { perror("fseek"); fclose(f); return -1; }
-    long sz = ftell(f);
-    if (sz < 0) { perror("ftell"); fclose(f); return -1; }
-    if (fseek(f, 0, SEEK_SET) != 0) { perror("fseek"); fclose(f); return -1; }
-
-    char *buf = (char*)malloc((size_t)sz + 1);
-    if (!buf) { perror("malloc"); fclose(f); return -1; }
-    size_t rd = fread(buf, 1, (size_t)sz, f);
-    fclose(f);
-    if (rd != (size_t)sz) { fprintf(stderr, "Short read\n"); free(buf); return -1; }
-    buf[sz] = '\0';
-
-    double val = 0.0; size_t errpos = 0;
-    int ok = evaluate_buffer(buf, (size_t)sz, &val, &errpos);
-    free(buf);
-    return write_result_file(outdir, infile, 0, val, ok, errpos);
-}
-
-static int ends_with_txt(const char *name) {
-    size_t len = strlen(name);
-    return (len >= 4 && strcmp(name+len-4, ".txt")==0);
-}
-
-static int process_directory(const char *dirpath, const char *outdir) {
-    DIR *d = opendir(dirpath);
-    if (!d) { perror("opendir"); return -1; }
-    struct dirent *ent;
-    int rc = 0;
-    while ((ent = readdir(d)) != NULL) {
-        if (strcmp(ent->d_name, ".")==0 || strcmp(ent->d_name, "..")==0) continue;
-        char path[PATH_MAX];
-        snprintf(path, sizeof(path), "%s/%s", dirpath, ent->d_name);
-
-        // Stat to ensure it's a regular file and ends with .txt
-        struct stat st;
-        if (stat(path, &st) != 0) continue;
-        if (!S_ISREG(st.st_mode)) continue;
-        if (!ends_with_txt(ent->d_name)) continue;
-
-        if (process_single_file(path, outdir) != 0) rc = -1;
-    }
-    closedir(d);
-    return rc;
-}
-
-// ---------- CLI ----------
-static void usage(const char *prog) {
-    fprintf(stderr, "Usage:\n");
-    fprintf(stderr, "  %s [-d DIR|--dir DIR] [-o OUTDIR|--output-dir OUTDIR] input.txt\n", prog);
-    fprintf(stderr, "Notes:\n");
-    fprintf(stderr, "  - If -d/--dir is provided, processes all *.txt in DIR (ignores subfolders). 'input.txt' is ignored in this mode.\n");
-    fprintf(stderr, "  - If -o is omitted, creates default output folder <input_base>_<username>_%s.\n", STUDENT_ID);
-}
-
-int main(int argc, char **argv) {
-    const char *diropt = NULL;
-    const char *outdir_opt = NULL;
-    const char *input_file = NULL;
-
-    // Simple argv parse
-    for (int i=1; i<argc; i++) {
-        if ((strcmp(argv[i], "-d")==0 || strcmp(argv[i], "--dir")==0) && i+1<argc) {
-            diropt = argv[++i];
-        } else if ((strcmp(argv[i], "-o")==0 || strcmp(argv[i], "--output-dir")==0) && i+1<argc) {
-            outdir_opt = argv[++i];
-        } else if (argv[i][0] == '-' ) {
-            usage(argv[0]); return 2;
-        } else {
-            input_file = argv[i];
-        }
-    }
-
-    if (!diropt && !input_file) { usage(argv[0]); return 2; }
-
-    char outdir[PATH_MAX];
-    if (outdir_opt) {
-        snprintf(outdir, sizeof(outdir), "%s", outdir_opt);
+        closedir(d);
     } else {
-        // Choose default based on single input or dir
-        char label[PATH_MAX];
-        if (diropt) {
-            // Use last path component of diropt as base
-            const char *base = strrchr(diropt, '/');
-#ifdef _WIN32
-            const char *base2 = strrchr(diropt, '\\');
-            if (!base || (base2 && base2 > base)) base = base2;
-#endif
-            base = base ? base+1 : diropt;
-            snprintf(label, sizeof(label), "%s", base);
-        } else {
-            basename_noext(input_file, label, sizeof(label));
-        }
-        choose_default_outdir(label, outdir, sizeof(outdir));
+        rc = process_one(input, outd);
     }
-
-    if (ensure_dir_exists(outdir) != 0) return 1;
-
-    int rc = 0;
-    if (diropt) {
-        rc = process_directory(diropt, outdir);
-    } else {
-        rc = process_single_file(input_file, outdir);
-    }
-    return (rc==0) ? 0 : 1;
+    return rc?1:0;
 }
